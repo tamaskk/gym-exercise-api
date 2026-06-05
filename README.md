@@ -1,317 +1,187 @@
-# Gym Exercise & Workout-Task API
+# Gym Exercise & Workout-Task API (Next.js)
 
-A production-quality **NestJS + TypeScript** REST API that mirrors and extends the
+A **Next.js (App Router) + MongoDB** REST API that mirrors and extends the
 [ExerciseDB v1 dataset](https://oss.exercisedb.dev/api/v1) (by **AscendAPI**). It
-syncs the upstream catalogue into a local database, exposes rich
-filter/search/CRUD endpoints over it, and adds a **Workout-Task** domain so users
-can build and work through tracked workouts (search → create → complete).
+syncs the upstream catalogue into MongoDB, exposes rich filter/search/CRUD
+endpoints over it, and adds a **Workout-Task** domain so users can build and work
+through tracked workouts (search → create → complete).
+
+Built as Next.js Route Handlers so it **deploys to Vercel with zero config**.
 
 > **Attribution:** Exercise data © **AscendAPI** (ExerciseDB) — <https://ascendapi.com>.
-> Attribution is required by the source dataset's terms and is surfaced in
-> `GET /api/v1/liveness`, the Swagger description, and every sync result.
+> Surfaced in `GET /api/v1/liveness`, the Swagger description, and every sync result.
 
 ---
 
-## Contents
-
-- [Architecture & decisions](#architecture--decisions)
-- [Project structure](#project-structure)
-- [Getting started](#getting-started)
-- [Environment variables](#environment-variables)
-- [Database & migrations](#database--migrations)
-- [Syncing the dataset](#syncing-the-dataset)
-- [API reference](#api-reference)
-- [Pagination model](#pagination-model)
-- [Error model](#error-model)
-- [Testing](#testing)
-
----
-
-## Architecture & decisions
+## Stack & decisions
 
 | Concern | Choice | Why |
 |---|---|---|
-| Framework | NestJS 10 | Modular DI, first-class Swagger & validation. |
-| Persistence | **MongoDB + Mongoose** (`@nestjs/mongoose`) | Document model fits the exercise shape (nested string arrays, embedded workout items) with no joins. Mongoose integrates natively with Nest DI and gives schema-level validation & indexes. Works against MongoDB Atlas or a local `mongod`. |
-| Array storage | Native string arrays (lower-cased on ingestion) | Mongo filters arrays directly with `$all`, so case-insensitive token filtering needs no extra columns. Taxonomy fields are indexed. |
-| Fuzzy search | **Fuse.js** | Matches the source's `search` + `threshold` (0 = exact, 1 = loose) semantics. |
-| HTTP client | `@nestjs/axios` (HttpModule) | Sync client with retry + exponential backoff + throttling. |
-| Pagination | Reusable keyset (cursor) helper | One implementation (`common/pagination`) shared by every list endpoint; opaque cursors are exerciseId / task-id values, exactly like the source. |
-| Validation | Global `ValidationPipe` (`whitelist`, `transform`) | DTOs validated & coerced; unknown props rejected. |
-| Errors | Global exception filter | Maps everything to the documented `{ success, error }` model across 400/401/403/404/405/409/412/429/500. |
-
-All routes are served under the `/api/v1` prefix to mirror the upstream surface.
+| Framework | **Next.js 14 (App Router)** | API as Route Handlers under `app/api/v1/*`; one-click Vercel deploy. |
+| Persistence | **MongoDB + Mongoose** | Document model fits the data; one connection cached across serverless invocations (`lib/db.ts`). |
+| Validation | **Zod** | Schema validation for request bodies; errors map to the 400 envelope. |
+| Fuzzy search | **Fuse.js** | `search` + `threshold` (0 = exact, 1 = loose), same as the source. |
+| Pagination | Reusable keyset cursor helper | One implementation in `lib/http/pagination.ts`; opaque exerciseId / task-id cursors, same `meta` as the source. |
+| Errors | Central `handle()` wrapper | Every route maps thrown errors to `{ success:false, error:{...} }` across 400/404/409/500. |
 
 ## Project structure
 
 ```
-exercise-api/
-├── src/
-│   ├── main.ts                      # Bootstrap: prefix, CORS, Swagger at /docs
-│   ├── app.module.ts                # Root module: config, TypeORM, global pipe & filter
-│   ├── config/
-│   │   ├── configuration.ts         # Typed config from env
-│   │   └── env.validation.ts        # Boot-time env validation
-│   ├── common/
-│   │   ├── dto/                      # PaginationQueryDto, response envelopes (PageMeta)
-│   │   ├── decorators/              # @ApiStandardErrors()
-│   │   ├── errors/                  # ApiErrorResponse model + status→name map
-│   │   ├── filters/                 # AllExceptionsFilter
-│   │   ├── pagination/             # Reusable cursor pagination helper (Mongoose)
-│   │   └── transformers/           # CSV → lower-cased string[] transform
-│   ├── exercises/                   # schema, DTOs, service, controller, unit test
-│   ├── metadata/                    # bodyparts / muscles / equipments schemas
-│   ├── sync/                        # ExerciseDbClient + SyncService + controller
-│   ├── workout-tasks/               # task schema (embedded items), DTOs, service, controller, unit test
-│   └── health/                      # GET /liveness
-└── test/
-    ├── app.e2e-spec.ts              # End-to-end HTTP tests (in-memory SQLite)
-    └── jest-e2e.json
+src/
+  app/
+    page.tsx                          Landing page (endpoint list)
+    docs/page.tsx                     Swagger UI (reads /api/v1/openapi.json)
+    api/v1/
+      liveness/route.ts               GET  health check
+      exercises/route.ts              GET  filter   | POST create
+      exercises/search/route.ts       GET  fuzzy search
+      exercises/bodyparts|muscles|equipments/route.ts
+      exercises/[exerciseId]/route.ts GET | PATCH | DELETE
+      bodyparts|muscles|equipments/route.ts   GET metadata lists
+      sync/route.ts                   POST sync (chunkable)
+      sync/status/route.ts            GET  progress
+      workout-tasks/route.ts          GET list | POST create
+      workout-tasks/[id]/route.ts     GET | PATCH | DELETE
+      workout-tasks/[id]/start|complete/route.ts          PATCH
+      workout-tasks/[id]/items/[itemId]/complete/route.ts PATCH
+      openapi.json/route.ts           GET  OpenAPI spec
+  lib/
+    db.ts                 serverless Mongoose connection cache + ATTRIBUTION
+    models/               Mongoose schemas (exercise, metadata, workout-task)
+    http/                 errors, respond (envelopes + handle), pagination
+    validation/           Zod schemas
+    services/             exercises, metadata, workout-tasks, sync logic
+    exercisedb-client.ts  upstream fetch + retry/backoff
+    openapi.ts            OpenAPI 3 spec
+scripts/sync.ts           local full-sync runner (npm run sync:local)
+tests/services.test.ts    service tests (in-memory MongoDB)
 ```
 
 ## Getting started
 
-> Requires **Node.js ≥ 18** and a **MongoDB** instance (MongoDB Atlas or a local
-> `mongod`).
+> Requires **Node.js ≥ 18** and a **MongoDB** database (Atlas or local `mongod`).
 
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Create your env file and set MONGODB_URI
-cp .env.example .env
-#    e.g. MONGODB_URI=mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/exercise-api
-
-# 3. Run in watch mode
-npm run start:dev
-
-# 4. Open the docs
-open http://localhost:3000/docs
+cp .env.example .env          # then set MONGODB_URI
+npm run dev                   # http://localhost:3000
 ```
 
-The API is now live at `http://localhost:3000/api/v1`. Collections and indexes are
-created automatically on first use; the DB will be empty until you run a sync.
+- Landing page: `http://localhost:3000`
+- Swagger docs: `http://localhost:3000/docs`
+- API base: `http://localhost:3000/api/v1`
 
-> **Tip:** include a database name in the URI path (`.../exercise-api`). If you
-> omit it, MongoDB defaults to the `test` database.
+> **Tip:** include a database name in the URI path (`.../exercise-api`), otherwise
+> MongoDB defaults to the `test` database.
 
 ## Environment variables
 
-See [`.env.example`](.env.example). Key variables:
+See [`.env.example`](.env.example):
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `3000` | HTTP port. |
-| `MONGODB_URI` | `mongodb://127.0.0.1:27017/exercise-api` | MongoDB connection string (Atlas SRV URI or local). Include a DB name in the path. |
+| `MONGODB_URI` | `mongodb://127.0.0.1:27017/exercise-api` | MongoDB connection string. |
 | `SOURCE_API_BASE_URL` | `https://oss.exercisedb.dev/api/v1` | Upstream base URL. |
 | `SOURCE_API_TIMEOUT_MS` | `15000` | Per-request timeout. |
-| `SYNC_PAGE_SIZE` | `25` | Source page size while walking pagination (max 25). |
+| `SYNC_PAGE_SIZE` | `25` | Source page size (max 25). |
 | `SYNC_REQUEST_DELAY_MS` | `250` | Throttle between source page requests. |
-| `SYNC_MAX_RETRIES` | `5` | Retry attempts per source request (429/5xx/network). |
+| `SYNC_MAX_RETRIES` | `5` | Retry attempts (429/5xx/network). |
 
-The environment is validated at boot — a bad value fails fast with a clear message.
-
-## Database & schema
-
-Schemas live next to each module under `*/schemas/*.schema.ts` (Mongoose). There
-are no migrations to run: Mongoose creates collections on first write and builds
-the declared indexes automatically (unique `exerciseId`, indexed taxonomy fields,
-indexed workout `status`). Sync upserts are idempotent, so re-running `POST /sync`
-never duplicates data.
+> Don't set `PORT` on Vercel — the platform handles it.
 
 ## Syncing the dataset
 
-Pull the **entire** upstream catalogue (~1,500+ exercises) plus metadata into the
-local DB:
+Pull the ~1,500 upstream exercises + metadata into MongoDB. Two ways:
 
+**A) Locally (recommended for the initial load — no time limit):**
 ```bash
+npm run sync:local
+```
+
+**B) Over HTTP** (`POST /api/v1/sync`). The full walk takes ~80s, which can
+exceed serverless limits, so the endpoint is **chunkable**:
+```bash
+# one shot (fine locally / on a long-timeout host)
 curl -X POST http://localhost:3000/api/v1/sync
+
+# chunked: 20 pages per call, then continue from the returned nextCursor
+curl -X POST "http://localhost:3000/api/v1/sync?maxPages=20"
+# -> { "done": false, "nextCursor": "abc123", ... }
+curl -X POST "http://localhost:3000/api/v1/sync?maxPages=20&after=abc123"
+# repeat until { "done": true }
 ```
-
-The sync service:
-
-- Walks the source's **cursor pagination** to completion (`after = nextCursor`
-  until `hasNextPage` is false).
-- **Throttles** between pages and **retries** transient failures (429/5xx/network)
-  with exponential backoff (honouring `Retry-After`).
-- **Upserts** idempotently on `exerciseId` — safe to re-run anytime.
-- Syncs **body parts / muscles / equipment** from their endpoints, unioned with
-  values discovered on exercises.
-- Is guarded against concurrent runs (returns `already_running`).
-
-Poll progress while it runs:
-
-```bash
-curl http://localhost:3000/api/v1/sync/status
-```
+Progress: `GET /api/v1/sync/status`. Upserts are idempotent (safe to re-run).
 
 ## API reference
 
-All under `/api/v1`. Full interactive docs at **`/docs`**.
-
-### Exercises
+All under `/api/v1`. Interactive docs at **`/docs`**.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/exercises` | Advanced filtering: `name`, `targetMuscles`, `secondaryMuscles`, `bodyParts`, `equipments` (CSV) + cursor pagination. |
-| `GET` | `/exercises/search` | Fuzzy search: `search`, `threshold` (0–1), `limit`. |
-| `GET` | `/exercises/bodyparts` | Filter by `bodyParts`, paginated. |
-| `GET` | `/exercises/muscles` | Filter by `targetMuscles` / `secondaryMuscles`, paginated. |
-| `GET` | `/exercises/equipments` | Filter by `equipments`, paginated. |
+| `GET` | `/exercises` | Filter by name, target/secondary muscles, body parts, equipment + cursor pagination. |
+| `GET` | `/exercises/search` | Fuzzy search (`search`, `threshold`, `limit`). |
+| `GET` | `/exercises/bodyparts` · `/muscles` · `/equipments` | Filtered, paginated. |
 | `GET` | `/exercises/:exerciseId` | Single exercise. |
-| `POST` | `/exercises` | Create a custom exercise. |
+| `POST` | `/exercises` | Create custom exercise. |
 | `PATCH` | `/exercises/:exerciseId` | Update. |
 | `DELETE` | `/exercises/:exerciseId` | Delete (`204`). |
+| `GET` | `/bodyparts` · `/muscles` · `/equipments` | List metadata. |
+| `POST` | `/sync` · `GET /sync/status` | Trigger / monitor sync. |
+| `POST` | `/workout-tasks` | Create (optionally `seedExerciseIds`). |
+| `GET` | `/workout-tasks` | List (filter `status`, paginated). |
+| `GET/PATCH/DELETE` | `/workout-tasks/:id` | Detail / update / delete. |
+| `PATCH` | `/workout-tasks/:id/start` · `/complete` | Lifecycle. |
+| `PATCH` | `/workout-tasks/:id/items/:itemId/complete` | Mark item done. |
+| `GET` | `/liveness` | Health + attribution. |
 
-### Metadata
+List responses use `{ success, meta, data }`; single responses `{ success, data }`;
+errors `{ success:false, error:{ code, message, detail, timestamp, path } }`.
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/bodyparts` | List all body parts. |
-| `GET` | `/muscles` | List all muscles. |
-| `GET` | `/equipments` | List all equipment. |
-
-### Workout tasks
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/workout-tasks` | Create a task (optionally seeded from `items` / `seedExerciseIds`). |
-| `GET` | `/workout-tasks` | List, filter by `status`, paginated. |
-| `GET` | `/workout-tasks/:id` | Detail. |
-| `PATCH` | `/workout-tasks/:id` | Rename / replace & reorder items. |
-| `PATCH` | `/workout-tasks/:id/items/:itemId/complete` | Mark an item done. |
-| `PATCH` | `/workout-tasks/:id/start` | `draft → in_progress`. |
-| `PATCH` | `/workout-tasks/:id/complete` | `in_progress → completed`. |
-| `DELETE` | `/workout-tasks/:id` | Delete (`204`). |
-
-### Sync & health
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/sync` | Trigger a full sync; reports counts & timing. |
-| `GET` | `/sync/status` | Current/last sync progress. |
-| `GET` | `/liveness` | Health check + attribution. |
-
-### Example: search → create a workout
+### Example: search → build a workout
 
 ```bash
-# 1. Find chest exercises
 curl "http://localhost:3000/api/v1/exercises?bodyParts=chest&limit=5"
 
-# 2. Build a workout from two of them
 curl -X POST http://localhost:3000/api/v1/workout-tasks \
   -H 'Content-Type: application/json' \
   -d '{"title":"Push day","seedExerciseIds":["EIeI8Vf","trmaT4d"]}'
 
-# 3. Start it, complete an item, complete the workout
 curl -X PATCH http://localhost:3000/api/v1/workout-tasks/<id>/start
 curl -X PATCH http://localhost:3000/api/v1/workout-tasks/<id>/items/<itemId>/complete
 curl -X PATCH http://localhost:3000/api/v1/workout-tasks/<id>/complete
 ```
 
-## Deploy to Render
+## Deploy to Vercel
 
-This repo includes a [`render.yaml`](render.yaml) Blueprint that deploys the API
-as an always-on Node web service. The database stays on MongoDB Atlas.
-
-1. **Push to GitHub** (Render deploys from a Git repo):
+1. Push to GitHub (already wired to `tamaskk/gym-exercise-api`).
+2. [vercel.com/new](https://vercel.com/new) → import the repo. Next.js is detected
+   automatically — no build config needed.
+3. **Environment Variables** → add `MONGODB_URI` (your Atlas string, **with** a db
+   name like `/exercise-api`).
+4. **MongoDB Atlas → Network Access** → add `0.0.0.0/0` so Vercel can connect.
+5. Deploy. Then populate the data:
    ```bash
-   git init && git add -A && git commit -m "Initial commit"
-   git branch -M main
-   git remote add origin https://github.com/<you>/exercise-api.git
-   git push -u origin main
-   ```
-2. **Create the service:** in the [Render dashboard](https://dashboard.render.com)
-   → **New → Blueprint**, pick your repo. Render reads `render.yaml`.
-3. **Set the secret:** add `MONGODB_URI` (your Atlas SRV string, **with** a db name
-   like `/exercise-api`). It's marked `sync: false`, so it must be set in the
-   dashboard, never committed.
-4. **Allow Render in Atlas:** Atlas → **Network Access** → add `0.0.0.0/0` (or
-   Render's egress IPs) so the service can connect.
-5. **Deploy.** Render runs `npm ci && npm run build`, then `npm run start:prod`,
-   and health-checks `/api/v1/liveness`.
-6. **Populate the data once it's live:**
-   ```bash
-   curl -X POST https://<your-service>.onrender.com/api/v1/sync
+   # easiest: run the local sync once against the same Atlas DB
+   npm run sync:local
+   # or chunk it over HTTP on the deployment:
+   curl -X POST "https://<your-app>.vercel.app/api/v1/sync?maxPages=20"
    ```
 
-Docs will be at `https://<your-service>.onrender.com/docs`.
+Docs live at `https://<your-app>.vercel.app/docs`.
 
-> **Free plan caveat:** the service spins down after inactivity, so the first
-> request after idle takes ~30s to wake (and a sync started right after a cold
-> start counts against that). Upgrade to a paid instance to keep it warm.
-
-> **Don't set `PORT`** — Render injects it and `main.ts` already reads
-> `process.env.PORT`.
-
-## Pagination model
-
-Every list endpoint returns the source-compatible envelope:
-
-```json
-{
-  "success": true,
-  "meta": {
-    "total": 1789,
-    "hasNextPage": true,
-    "hasPreviousPage": false,
-    "nextCursor": "EIeI8Vf",
-    "previousCursor": null
-  },
-  "data": [ /* ... */ ]
-}
-```
-
-- `limit`: min `1`, max `25`, default `10`.
-- Forward: pass `after = meta.nextCursor`. Backward: pass `before = meta.previousCursor`.
-- Cursors are opaque (exerciseId / task id). Keyset pagination is used under the
-  hood (`$gt`/`$lt` on the sorted cursor field) for stable, efficient paging — see
-  `common/pagination/cursor-pagination.ts`.
-
-## Error model
-
-Errors use a consistent envelope across all documented status codes
-(400/401/403/404/405/409/412/429/500):
-
-```json
-{
-  "success": false,
-  "error": {
-    "code": 404,
-    "message": "Not Found",
-    "detail": "Exercise 'xyz' not found.",
-    "timestamp": "2026-06-05T10:00:00.000Z",
-    "path": "/api/v1/exercises/xyz"
-  }
-}
-```
+> **Serverless note:** `POST /sync` may exceed the function time limit (Vercel
+> Hobby ≤ 60s) for a full walk — use `?maxPages=` to chunk it, or just run
+> `npm run sync:local` once against the same database.
 
 ## Testing
 
-Tests spin up a throwaway MongoDB via `mongodb-memory-server` (a `mongod` binary
-is downloaded once on first run), so they need no external database and run fully
-offline after that.
-
 ```bash
-# Unit tests (services, in-memory MongoDB)
 npm test
-
-# End-to-end tests (full HTTP stack, in-memory MongoDB, no network)
-npm run test:e2e
-
-# Coverage
-npm run test:cov
 ```
-
-Included examples:
-
-- `src/exercises/exercises.service.spec.ts` — filtering, cursor pagination, fuzzy
-  search, idempotent upsert, create/update/conflict.
-- `src/workout-tasks/workout-tasks.service.spec.ts` — the full task lifecycle and
-  guard rails.
-- `test/app.e2e-spec.ts` — liveness, exercise CRUD, validation/error envelope, and
-  an end-to-end workout flow.
+Tests spin up a throwaway MongoDB via `mongodb-memory-server` (downloads a `mongod`
+binary once), so they need no external database. Coverage: exercise
+filtering/pagination/fuzzy-search/upsert/CRUD and the full workout-task lifecycle.
 
 ---
 
-Built with NestJS. Exercise data © AscendAPI (ExerciseDB).
+Built with Next.js. Exercise data © AscendAPI (ExerciseDB).
