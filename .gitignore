@@ -1,0 +1,22 @@
+/dist
+/node_modules
+/coverage
+
+# env
+.env
+.env.local
+
+# sqlite db files
+*.sqlite
+*.sqlite3
+*.db
+
+# logs
+*.log
+npm-debug.log*
+
+# IDE / OS
+.idea
+.vscode
+.DS_Store
+*.tsbuildinfo
